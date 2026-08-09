@@ -5,7 +5,11 @@
 # ==============================================================================
 
 # Strict safety error handling
-set -uo pipefail
+set -euo pipefail
+IFS=$'\n\t'
+
+# Graceful exit handling
+trap 'echo -e "\n\033[1;32m[*] Exiting Vapux Manager gracefully. Goodbye!\033[0m"; exit 0' SIGINT SIGTERM
 
 # XDG Standard Directories for Vapux
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/vapux"
@@ -22,7 +26,7 @@ mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$SHARED_PREFIX" "$FREESM_DIR" "$VAPE_DIR"
 DEFAULT_PROTON="/usr/share/steam/compatibilitytools.d/proton-cachyos-native-msgwaitall"
 
 # Load or initialize configuration file
-if [ -f "$CONFIG_FILE" ]; then
+if [[ -f "$CONFIG_FILE" ]]; then
     source "$CONFIG_FILE"
 else
     PROTON_PATH="$DEFAULT_PROTON"
@@ -38,10 +42,10 @@ check_system() {
         fi
     done
 
-    if [ ${#missing[@]} -gt 0 ]; then
+    if [[ ${#missing[@]} -gt 0 ]]; then
         echo -e "\033[1;31m[!] Error: Missing required system dependencies: ${missing[*]}\033[0m"
-        echo "Please install them via your package manager:"
-        echo "  -> sudo pacman -S umu-launcher unzip curl"
+        echo "Please install them via your package manager."
+        echo "  -> For Arch-based: sudo pacman -S umu-launcher unzip curl"
         exit 1
     fi
 }
@@ -54,7 +58,7 @@ verify_proton() {
     fi
 
     # Check if directory exists and contains toolmanifest.vdf
-    if [ ! -d "$PROTON_PATH" ] || [ ! -f "$PROTON_PATH/toolmanifest.vdf" ]; then
+    if [[ ! -d "$PROTON_PATH" ]] || [[ ! -f "$PROTON_PATH/toolmanifest.vdf" ]]; then
         echo -e "\033[1;33m[!] Warning: Valid toolmanifest.vdf not found in: $PROTON_PATH\033[0m"
         echo "[*] Opening configuration setup to fix path..."
         sleep 1.5
@@ -64,27 +68,39 @@ verify_proton() {
     return 0
 }
 
-# --- CORE FUNCTIONS ---
+get_vape_exe() {
+    # Safely find the first .exe in the Vape directory using nullglob
+    shopt -s nullglob
+    local exes=("$VAPE_DIR"/*.exe)
+    shopt -u nullglob
 
+    if [[ ${#exes[@]} -gt 0 ]]; then
+        echo "${exes[0]}"
+    else
+        echo ""
+    fi
+}
+
+# --- CORE FUNCTIONS ---
 setup_menu() {
     clear
     echo "=================================================="
     echo "        Vapux Manager - Setup & Configuration     "
     echo "=================================================="
-    echo "Current Proton directory: $PROTON_PATH"
-    echo "Shared Prefix path:       $SHARED_PREFIX"
+    echo -e "\033[1;36mCurrent Proton directory:\033[0m $PROTON_PATH"
+    echo -e "\033[1;36mShared Prefix path:\033[0m       $SHARED_PREFIX"
     echo ""
     read -rp "Enter path to Proton compatibility folder (or press Enter to keep): " new_path
     
     # Clean quotes if path was dragged and dropped from terminal
-    new_path=$(echo "$new_path" | sed "s/^'//;s/'$//")
+    new_path=$(echo "$new_path" | sed -e "s/^'//" -e "s/'$//" -e 's/^"//' -e 's/"$//')
 
-    if [ -n "$new_path" ]; then
+    if [[ -n "$new_path" ]]; then
         if [[ "$new_path" == */proton ]]; then
             new_path="$(dirname "$new_path")"
         fi
 
-        if [ -d "$new_path" ] && [ -f "$new_path/toolmanifest.vdf" ]; then
+        if [[ -d "$new_path" ]] && [[ -f "$new_path/toolmanifest.vdf" ]]; then
             PROTON_PATH="$new_path"
             echo "PROTON_PATH=\"$PROTON_PATH\"" > "$CONFIG_FILE"
             echo -e "\033[1;32m[+] Proton directory updated successfully!\033[0m"
@@ -100,49 +116,61 @@ setup_menu() {
 run_minecraft() {
     verify_proton || return
 
-    EXE_PATH="$FREESM_DIR/freesmlauncher.exe"
+    local EXE_PATH="$FREESM_DIR/freesmlauncher.exe"
 
-    if [ ! -f "$EXE_PATH" ]; then
+    if [[ ! -f "$EXE_PATH" ]]; then
         echo "[*] FreesmLauncher not found. Downloading MSVC Portable version..."
-        ZIP_URL="https://github.com/FreesmTeam/FreesmLauncher/releases/download/2.2.2/FreesmLauncher-Windows-MSVC-Portable-2.2.2.zip"
-        ZIP_PATH="$DATA_DIR/freesm.zip"
+        local ZIP_URL="https://github.com/FreesmTeam/FreesmLauncher/releases/download/2.2.2/FreesmLauncher-Windows-MSVC-Portable-2.2.2.zip"
+        local ZIP_PATH="$DATA_DIR/freesm.zip"
 
-        curl -L "$ZIP_URL" -o "$ZIP_PATH" || {
-            echo -e "\033[1;31m[!] Failed to download FreesmLauncher package.\033[0m"
+        # Using --fail to catch HTTP errors (like 404) natively
+        if ! curl --fail -L --progress-bar "$ZIP_URL" -o "$ZIP_PATH"; then
+            echo -e "\033[1;31m[!] Failed to download FreesmLauncher package. Check network or URL.\033[0m"
             sleep 2
             return
-        }
+        fi
 
         echo "[*] Extracting package files..."
         unzip -qo "$ZIP_PATH" -d "$FREESM_DIR"
         rm -f "$ZIP_PATH"
         echo -e "\033[1;32m[+] FreesmLauncher installed successfully to $FREESM_DIR\033[0m"
+        sleep 1
     fi
 
-    echo "[*] Launching Minecraft (FreesmLauncher) via umu-run..."
-    WINEPREFIX="$SHARED_PREFIX" PROTONPATH="$PROTON_PATH" umu-run "$EXE_PATH" &
+    echo -e "\033[1;32m[*] Launching Minecraft (FreesmLauncher) silently in background...\033[0m"
+    
+    # Suppress output, run in background, and detach so terminal remains clean
+    env WINEPREFIX="$SHARED_PREFIX" \
+        PROTONPATH="$PROTON_PATH" \
+        WINEDEBUG="-all" \
+        UMU_LOG_LEVEL=0 \
+        umu-run "$EXE_PATH" > /dev/null 2>&1 & disown
+    
     sleep 1
 }
 
 run_vape() {
     verify_proton || return
 
-    VAPE_EXE=$(find "$VAPE_DIR" -maxdepth 1 -name "*.exe" | head -n 1)
+    local VAPE_EXE
+    VAPE_EXE=$(get_vape_exe)
 
-    if [ -z "$VAPE_EXE" ]; then
+    if [[ -z "$VAPE_EXE" ]]; then
         clear
         echo "=================================================="
         echo "              Vapux Manager - VapeV4 Setup        "
         echo "=================================================="
-        echo "[!] No VapeV4 executable found in $VAPE_DIR"
+        echo -e "\033[1;33m[!] No VapeV4 executable found in $VAPE_DIR\033[0m"
         read -rp "Drag and drop or type the full path to your VapeV4 .exe file: " source_exe
         
-        source_exe=$(echo "$source_exe" | sed "s/^'//;s/'$//")
+        # Clean potential quotes from terminal drag-and-drop
+        source_exe=$(echo "$source_exe" | sed -e "s/^'//" -e "s/'$//" -e 's/^"//' -e 's/"$//')
 
-        if [ -f "$source_exe" ]; then
+        if [[ -f "$source_exe" ]]; then
             cp "$source_exe" "$VAPE_DIR/"
-            VAPE_EXE=$(find "$VAPE_DIR" -maxdepth 1 -name "*.exe" | head -n 1)
+            VAPE_EXE=$(get_vape_exe)
             echo -e "\033[1;32m[+] VapeV4 saved successfully to $VAPE_DIR\033[0m"
+            sleep 1
         else
             echo -e "\033[1;31m[!] Invalid file path provided. Aborting setup.\033[0m"
             sleep 2
@@ -150,9 +178,16 @@ run_vape() {
         fi
     fi
 
-    echo "[*] Launching VapeV4 via umu-run into the shared prefix..."
-    # PROTON_VERB=runinprefix tells umu-run to attach to the active prefix without lock collisions
-    WINEPREFIX="$SHARED_PREFIX" PROTONPATH="$PROTON_PATH" PROTON_VERB=runinprefix umu-run "$VAPE_EXE" &
+    echo -e "\033[1;32m[*] Launching VapeV4 silently into the shared prefix...\033[0m"
+    
+    # PROTON_VERB=runinprefix tells umu-run to attach to the active prefix
+    env WINEPREFIX="$SHARED_PREFIX" \
+        PROTONPATH="$PROTON_PATH" \
+        PROTON_VERB="runinprefix" \
+        WINEDEBUG="-all" \
+        UMU_LOG_LEVEL=0 \
+        umu-run "$VAPE_EXE" > /dev/null 2>&1 & disown
+        
     sleep 1
 }
 
@@ -163,34 +198,32 @@ check_system
 while true; do
     clear
     echo "=================================================="
-    echo "       Vapux Manager - A VapeV4 Manager for Linux   "
+    echo -e " \033[1;36mVapux Manager - A VapeV4 Manager for Linux\033[0m "
     echo "=================================================="
     echo " 1) Run Minecraft (FreesmLauncher)"
-    echo " 2) Run VapeV4"
+    echo " 2) Run VapeV4 (Attaches to Prefix)"
     echo " 3) Setup / Configure Proton Path"
     echo " 4) Exit"
     echo "=================================================="
     read -rp "Select an option [1-4]: " choice
 
-    case $choice in
+    case "$choice" in
         1)
             run_minecraft
-            sleep 1.5
             ;;
         2)
             run_vape
-            sleep 1.5
             ;;
         3)
             setup_menu
             ;;
         4)
-            echo "Exiting Vapux Manager. Have a nice day!"
+            echo -e "\n\033[1;32mExiting Vapux Manager. Have a nice day!\033[0m"
             exit 0
             ;;
         *)
             echo -e "\033[1;31m[!] Invalid option, please choose between 1 and 4.\033[0m"
-            sleep 1
+            sleep 1.5
             ;;
     esac
 done
